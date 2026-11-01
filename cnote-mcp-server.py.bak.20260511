@@ -1,0 +1,800 @@
+"""
+C-Note MCP Server
+Personal knowledge vault management for /Users/lupin/_Workspace/Docs/C-Note
+"""
+
+import json
+import os
+import re
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+from mcp.server.fastmcp import FastMCP
+from pydantic import BaseModel, Field, ConfigDict
+
+# ── Constants ──────────────────────────────────────────────────────────────────
+
+VAULT_ROOT = Path("/Users/lupin/_Workspace/Docs/C-Note")
+META_DIR = VAULT_ROOT / ".cnote"
+INDEX_FILE = META_DIR / "index.json"
+LOG_FILE = META_DIR / "activity.log"
+CONFIG_FILE = META_DIR / "config.json"
+VAULT_INDEX_FILE = VAULT_ROOT / "_system" / "index.md"
+MAX_LOG_LINES = 200
+
+# Content categories → folder mapping
+CATEGORY_PATHS = {
+    "dev/lemr": "topics/dev/lemr",
+    "dev/projects": "topics/dev/projects",
+    "dev/general": "topics/dev/general",
+    "music": "topics/music",
+    "audio": "topics/audio",
+    "career": "topics/career",
+    "home": "topics/home",
+    "personal": "topics/personal",
+    "ref/code": "reference/code",
+    "ref/software": "reference/software",
+    "ref/audio": "reference/audio",
+    "ref/general": "reference/general",
+}
+
+# Note types
+NOTE_TYPES = [
+    "log",
+    "reference",
+    "snippet",
+    "roadmap",
+    "instructions",
+    "index",
+    "daily",
+]
+
+mcp = FastMCP("cnote_mcp")
+
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+
+def ensure_vault():
+    """Create vault folder structure if it doesn't exist."""
+    META_DIR.mkdir(parents=True, exist_ok=True)
+    for rel in CATEGORY_PATHS.values():
+        (VAULT_ROOT / rel).mkdir(parents=True, exist_ok=True)
+    (VAULT_ROOT / "daily").mkdir(parents=True, exist_ok=True)
+    if not INDEX_FILE.exists():
+        INDEX_FILE.write_text(json.dumps({"notes": {}}, indent=2))
+    if not LOG_FILE.exists():
+        LOG_FILE.write_text("")
+    if not CONFIG_FILE.exists():
+        CONFIG_FILE.write_text(
+            json.dumps(
+                {
+                    "default_daily_fallback": True,
+                    "tag_style": "inline",  # #category/sub
+                },
+                indent=2,
+            )
+        )
+
+
+def load_index() -> dict:
+    ensure_vault()
+    return json.loads(INDEX_FILE.read_text())
+
+
+def save_index(idx: dict):
+    INDEX_FILE.write_text(json.dumps(idx, indent=2))
+
+
+def append_log(action: str, path: str, detail: str = ""):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    line = f"{ts} | {action} | {path} | {detail}\n"
+    existing = LOG_FILE.read_text() if LOG_FILE.exists() else ""
+    lines = existing.splitlines(keepends=True)
+    lines = lines[-(MAX_LOG_LINES - 1) :]  # keep rolling window
+    lines.append(line)
+    LOG_FILE.write_text("".join(lines))
+
+
+def today_daily_path() -> Path:
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    return VAULT_ROOT / "daily" / f"{date_str}.md"
+
+
+def slugify(text: str) -> str:
+    text = text.lower().strip()
+    text = re.sub(r"[^\w\s-]", "", text)
+    text = re.sub(r"[\s_]+", "-", text)
+    return text[:60]
+
+
+def auto_tags(content: str, category: str, note_type: str) -> list[str]:
+    """Generate inline tags from category, type, and content hints."""
+    tags = [f"#{category.replace('/', '/')}", f"#type/{note_type}"]
+    # simple keyword boosters
+    kw_map = {
+        "lemr": "#dev/lemr",
+        "next.js": "#dev/nextjs",
+        "spring": "#dev/spring",
+        "ableton": "#music/ableton",
+        "plugin": "#audio/plugin",
+        "resume": "#career/resume",
+    }
+    lower = content.lower()
+    for kw, tag in kw_map.items():
+        if kw in lower and tag not in tags:
+            tags.append(tag)
+    return tags
+
+
+def _folder_section_header(rel_path: str) -> str:
+    """Return the ### section header string for a given rel_path."""
+    folder = "/".join(rel_path.split("/")[:-1]) + "/"
+    return f"### {folder}"
+
+
+def update_vault_index_md(
+    rel_path: str,
+    title: str,
+    tags: list[str],
+    description: str = "",
+):
+    """Add or update a single file entry in _system/index.md.
+
+    Finds the ### section matching the file's folder and either:
+    - Replaces the existing line for this rel_path (update)
+    - Appends a new line after the section header (create)
+
+    Skips daily/ paths — those are never listed individually.
+
+    Args:
+        rel_path:    Vault-relative path, e.g. "topics/dev/lemr/setup.md"
+        title:       Note title (used as fallback description if none given)
+        tags:        List of tag strings, e.g. ["#dev/lemr", "#type/log"]
+        description: One-sentence summary of what the file contains.
+                     If empty, falls back to title.
+    """
+    if rel_path.startswith("daily/"):
+        return  # daily notes are never individually indexed
+
+    if not VAULT_INDEX_FILE.exists():
+        return  # index.md not yet created; skip silently
+
+    desc = description.strip() if description.strip() else title
+    tag_str = "  ".join(tags)
+    date_str = datetime.now().strftime("%Y-%m-%d")
+    new_entry = f"- `{rel_path}` — {desc} · {tag_str} · {date_str}"
+
+    section_header = _folder_section_header(rel_path)
+    lines = VAULT_INDEX_FILE.read_text().splitlines()
+
+    # Replace existing entry for this rel_path if present
+    for i, line in enumerate(lines):
+        if f"`{rel_path}`" in line and line.strip().startswith("- "):
+            lines[i] = new_entry
+            VAULT_INDEX_FILE.write_text("\n".join(lines) + "\n")
+            return
+
+    # No existing entry — find the section header and insert after it.
+    # If the section has a *(no files yet)* placeholder, replace that line.
+    for i, line in enumerate(lines):
+        if line.strip() == section_header.strip():
+            # Check if next non-blank line is the placeholder
+            j = i + 1
+            while j < len(lines) and lines[j].strip() == "":
+                j += 1
+            if j < len(lines) and lines[j].strip().startswith("*(no files yet)"):
+                lines[j] = new_entry
+            else:
+                lines.insert(i + 1, "")
+                lines.insert(i + 2, new_entry)
+            VAULT_INDEX_FILE.write_text("\n".join(lines) + "\n")
+            return
+
+    # Section header not found — append a new section at end of file
+    section_block = (
+        f"\n\n{section_header}\n> *(auto-added section)*\n\n{new_entry}"
+    )
+    with VAULT_INDEX_FILE.open("a") as f:
+        f.write(section_block + "\n")
+
+
+def index_note(
+    idx: dict,
+    rel_path: str,
+    title: str,
+    category: str,
+    note_type: str,
+    tags: list[str],
+    description: str = "",
+):
+    idx["notes"][rel_path] = {
+        "title": title,
+        "category": category,
+        "type": note_type,
+        "tags": tags,
+        "updated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+    update_vault_index_md(rel_path, title, tags, description)
+
+
+def find_existing_topic_file(
+    idx: dict, category: str, title_hint: str
+) -> Optional[str]:
+    """Return rel_path of an existing note in the same category whose title is similar."""
+    title_lower = title_hint.lower()
+    for rel_path, meta in idx["notes"].items():
+        if meta.get("category") == category:
+            if any(
+                word in meta["title"].lower()
+                for word in title_lower.split()
+                if len(word) > 3
+            ):
+                return rel_path
+    return None
+
+
+def write_note_file(
+    path: Path,
+    title: str,
+    content: str,
+    tags: list[str],
+    note_type: str,
+    append: bool = False,
+):
+    tag_line = "  ".join(tags)
+    if append and path.exists():
+        existing = path.read_text()
+        # append under a datestamped section
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+        addition = f"\n---\n*Added {ts}*\n\n{content}\n\n{tag_line}\n"
+        path.write_text(existing + addition)
+    else:
+        ts = datetime.now().strftime("%Y-%m-%d")
+        header = f"# {title}\n*Created {ts}* · `#{note_type}`\n\n"
+        body = f"{header}{content}\n\n{tag_line}\n"
+        path.write_text(body)
+
+
+# ── Input Models ───────────────────────────────────────────────────────────────
+
+
+class AddNoteInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    title: str = Field(
+        ...,
+        description="Short descriptive title for the note",
+        min_length=1,
+        max_length=120,
+    )
+    content: str = Field(
+        ..., description="The note body content (markdown supported)", min_length=1
+    )
+    category: str = Field(
+        ...,
+        description=(
+            "Content category. One of: dev/lemr, dev/projects, dev/general, music, audio, "
+            "career, home, personal. Use 'daily' to force drop into today's daily note."
+        ),
+    )
+    note_type: str = Field(
+        default="log",
+        description="Note type: log, reference, snippet, roadmap, instructions, index, daily",
+    )
+    extra_tags: Optional[list[str]] = Field(
+        default_factory=list,
+        description="Any additional inline tags to include e.g. ['#tool/obsidian']",
+    )
+    force_new: bool = Field(
+        default=False,
+        description="If True, always create a new file even if a related topic file exists",
+    )
+
+
+class FileReferenceInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+
+    content: str = Field(
+        ...,
+        description="The reference content to file (paste, docs excerpt, code block, etc.)",
+        min_length=1,
+    )
+    source: Optional[str] = Field(
+        default=None, description="URL or source name of the reference"
+    )
+    title: Optional[str] = Field(
+        default=None,
+        description="Optional title. If omitted, one is inferred.",
+        max_length=120,
+    )
+    category: Optional[str] = Field(
+        default=None,
+        description="Hint for category (ref/code, ref/software, ref/audio, ref/general, or a topic category). If omitted, inferred from content.",
+    )
+
+
+class SearchInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    query: str = Field(
+        ...,
+        description="Search terms to look for in titles, tags, or content",
+        min_length=1,
+    )
+    category: Optional[str] = Field(
+        default=None, description="Limit search to a category"
+    )
+    note_type: Optional[str] = Field(
+        default=None, description="Limit search to a note type"
+    )
+    limit: int = Field(default=10, description="Max results to return", ge=1, le=50)
+
+
+class GetNoteInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    rel_path: str = Field(
+        ...,
+        description="Relative path to the note file as shown in the index (e.g. topics/dev/lemr/setup.md)",
+    )
+
+
+class AppendInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    rel_path: str = Field(..., description="Relative path of the note to append to")
+    content: str = Field(..., description="Content to append", min_length=1)
+
+
+# ── Tools ──────────────────────────────────────────────────────────────────────
+
+
+@mcp.tool(
+    name="cnote_add",
+    annotations={
+        "title": "Add Note to Vault",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def cnote_add(params: AddNoteInput) -> str:
+    """Add a new note or append to an existing topic note in the C-Note vault.
+
+    Routing logic:
+    - If category is 'daily' or no good topic match found → today's daily note
+    - If a related topic file already exists in the category → appends to it
+    - Otherwise → creates a new topic file
+
+    Returns a JSON summary with the file path and action taken.
+
+    Args:
+        params (AddNoteInput): Validated input with title, content, category, note_type, extra_tags, force_new
+
+    Returns:
+        str: JSON with keys: action, path, title, tags, message
+    """
+    ensure_vault()
+    idx = load_index()
+
+    tags = auto_tags(params.content, params.category, params.note_type)
+    tags += [t for t in (params.extra_tags or []) if t not in tags]
+
+    # Determine routing
+    if params.category == "daily":
+        file_path = today_daily_path()
+        rel_path = f"daily/{file_path.name}"
+        append = file_path.exists()
+        action = "appended-daily" if append else "created-daily"
+        write_note_file(
+            file_path,
+            params.title,
+            params.content,
+            tags,
+            params.note_type,
+            append=append,
+        )
+        index_note(idx, rel_path, params.title, params.category, params.note_type, tags)
+    else:
+        existing_rel = (
+            None
+            if params.force_new
+            else find_existing_topic_file(idx, params.category, params.title)
+        )
+
+        if existing_rel:
+            file_path = VAULT_ROOT / existing_rel
+            rel_path = existing_rel
+            write_note_file(
+                file_path,
+                params.title,
+                params.content,
+                tags,
+                params.note_type,
+                append=True,
+            )
+            # Update index entry updated timestamp
+            idx["notes"][rel_path]["updated"] = datetime.now().strftime(
+                "%Y-%m-%d %H:%M"
+            )
+            action = "appended-topic"
+        else:
+            folder = CATEGORY_PATHS.get(params.category, "topics/personal")
+            filename = slugify(params.title) + ".md"
+            file_path = VAULT_ROOT / folder / filename
+            # avoid collisions
+            counter = 1
+            while file_path.exists():
+                file_path = (
+                    VAULT_ROOT / folder / f"{slugify(params.title)}-{counter}.md"
+                )
+                counter += 1
+            rel_path = str(file_path.relative_to(VAULT_ROOT))
+            write_note_file(
+                file_path,
+                params.title,
+                params.content,
+                tags,
+                params.note_type,
+                append=False,
+            )
+            index_note(
+                idx, rel_path, params.title, params.category, params.note_type, tags
+            )
+            action = "created-topic"
+
+    save_index(idx)
+    append_log(action, rel_path, params.title)
+
+    return json.dumps(
+        {
+            "action": action,
+            "path": rel_path,
+            "title": params.title,
+            "tags": tags,
+            "message": f"Note '{params.title}' → {rel_path} ({action})",
+        },
+        indent=2,
+    )
+
+
+@mcp.tool(
+    name="cnote_file_reference",
+    annotations={
+        "title": "File Reference Material",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def cnote_file_reference(params: FileReferenceInput) -> str:
+    """File pasted reference material (docs, code, instructions, web content) into the vault.
+
+    Infers category and title from content if not supplied.
+    Always creates a new file in the appropriate reference or topic folder.
+
+    Args:
+        params (FileReferenceInput): content, source, title, category
+
+    Returns:
+        str: JSON with path, inferred_category, title, message
+    """
+    ensure_vault()
+    idx = load_index()
+
+    content = params.content
+    source_line = f"\n\n> Source: {params.source}" if params.source else ""
+    full_content = content + source_line
+
+    # Infer category
+    category = params.category
+    if not category:
+        lower = content.lower()
+        if any(
+            k in lower
+            for k in ["npm", "pip", "import ", "def ", "function ", "const ", "```"]
+        ):
+            category = "ref/code"
+        elif any(k in lower for k in ["plugin", "daw", "ableton", "sample", "midi"]):
+            category = "ref/audio"
+        elif any(k in lower for k in ["install", "setup", "configure", "settings"]):
+            category = "ref/software"
+        else:
+            category = "ref/general"
+
+    # Infer title
+    title = params.title
+    if not title:
+        first_line = content.strip().splitlines()[0]
+        title = re.sub(r"^[#\s]+", "", first_line)[:80] or "Reference Note"
+
+    note_type = "reference"
+    tags = auto_tags(content, category, note_type)
+
+    folder = CATEGORY_PATHS.get(category, "reference/general")
+    filename = slugify(title) + ".md"
+    file_path = VAULT_ROOT / folder / filename
+    counter = 1
+    while file_path.exists():
+        file_path = VAULT_ROOT / folder / f"{slugify(title)}-{counter}.md"
+        counter += 1
+    rel_path = str(file_path.relative_to(VAULT_ROOT))
+
+    write_note_file(file_path, title, full_content, tags, note_type, append=False)
+    index_note(idx, rel_path, title, category, note_type, tags)
+    save_index(idx)
+    append_log("created-reference", rel_path, title)
+
+    return json.dumps(
+        {
+            "path": rel_path,
+            "inferred_category": category,
+            "title": title,
+            "tags": tags,
+            "message": f"Reference '{title}' → {rel_path}",
+        },
+        indent=2,
+    )
+
+
+@mcp.tool(
+    name="cnote_search",
+    annotations={
+        "title": "Search Notes",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def cnote_search(params: SearchInput) -> str:
+    """Search the C-Note vault index and file contents for a query.
+
+    First searches index metadata (fast), then scans file content for matches.
+
+    Args:
+        params (SearchInput): query, optional category/note_type filters, limit
+
+    Returns:
+        str: JSON array of matches with path, title, category, type, snippet, score
+    """
+    ensure_vault()
+    idx = load_index()
+    query_terms = params.query.lower().split()
+    results = []
+
+    for rel_path, meta in idx["notes"].items():
+        if params.category and meta.get("category") != params.category:
+            continue
+        if params.note_type and meta.get("type") != params.note_type:
+            continue
+
+        score = 0
+        searchable = (
+            meta.get("title", "") + " " + " ".join(meta.get("tags", []))
+        ).lower()
+        for term in query_terms:
+            if term in searchable:
+                score += 2
+
+        # scan file content for additional hits
+        snippet = ""
+        file_path = VAULT_ROOT / rel_path
+        if file_path.exists():
+            try:
+                text = file_path.read_text()
+                lower_text = text.lower()
+                for term in query_terms:
+                    if term in lower_text:
+                        score += 1
+                        idx_found = lower_text.find(term)
+                        start = max(0, idx_found - 60)
+                        end = min(len(text), idx_found + 120)
+                        snippet = "..." + text[start:end].strip() + "..."
+                        break
+            except Exception:
+                pass
+
+        if score > 0:
+            results.append(
+                {
+                    "path": rel_path,
+                    "title": meta.get("title", rel_path),
+                    "category": meta.get("category", ""),
+                    "type": meta.get("type", ""),
+                    "tags": meta.get("tags", []),
+                    "updated": meta.get("updated", ""),
+                    "score": score,
+                    "snippet": snippet,
+                }
+            )
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+    results = results[: params.limit]
+
+    return json.dumps(
+        {"query": params.query, "count": len(results), "results": results}, indent=2
+    )
+
+
+@mcp.tool(
+    name="cnote_get_note",
+    annotations={
+        "title": "Get Note Content",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def cnote_get_note(params: GetNoteInput) -> str:
+    """Return the full content of a note by its relative path.
+
+    Args:
+        params (GetNoteInput): rel_path of the note
+
+    Returns:
+        str: JSON with path, meta, content
+    """
+    ensure_vault()
+    idx = load_index()
+    file_path = VAULT_ROOT / params.rel_path
+    if not file_path.exists():
+        return json.dumps({"error": f"File not found: {params.rel_path}"})
+    content = file_path.read_text()
+    meta = idx["notes"].get(params.rel_path, {})
+    return json.dumps(
+        {"path": params.rel_path, "meta": meta, "content": content}, indent=2
+    )
+
+
+@mcp.tool(
+    name="cnote_append",
+    annotations={
+        "title": "Append to Existing Note",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def cnote_append(params: AppendInput) -> str:
+    """Append content to an existing note by its relative path.
+
+    Use when you know exactly which file to add to (e.g. after a search).
+
+    Args:
+        params (AppendInput): rel_path, content
+
+    Returns:
+        str: JSON confirmation with path and message
+    """
+    ensure_vault()
+    idx = load_index()
+    file_path = VAULT_ROOT / params.rel_path
+    if not file_path.exists():
+        return json.dumps({"error": f"File not found: {params.rel_path}"})
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    addition = f"\n---\n*Added {ts}*\n\n{params.content}\n"
+    existing = file_path.read_text()
+    file_path.write_text(existing + addition)
+
+    if params.rel_path in idx["notes"]:
+        idx["notes"][params.rel_path]["updated"] = ts
+        save_index(idx)
+
+    append_log("appended", params.rel_path, "manual append")
+    return json.dumps(
+        {"path": params.rel_path, "message": f"Appended to {params.rel_path}"}, indent=2
+    )
+
+
+@mcp.tool(
+    name="cnote_get_index",
+    annotations={
+        "title": "Get Vault Index",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def cnote_get_index(
+    category: Optional[str] = None, note_type: Optional[str] = None
+) -> str:
+    """Return the vault index, optionally filtered by category or type.
+
+    Useful at the start of a session to get the lay of the land.
+
+    Args:
+        category (str, optional): Filter by category
+        note_type (str, optional): Filter by note type
+
+    Returns:
+        str: JSON index summary with note count and entries
+    """
+    ensure_vault()
+    idx = load_index()
+    notes = idx["notes"]
+
+    if category:
+        notes = {k: v for k, v in notes.items() if v.get("category") == category}
+    if note_type:
+        notes = {k: v for k, v in notes.items() if v.get("type") == note_type}
+
+    return json.dumps(
+        {
+            "total_notes": len(notes),
+            "filters": {"category": category, "note_type": note_type},
+            "notes": notes,
+        },
+        indent=2,
+    )
+
+
+@mcp.tool(
+    name="cnote_get_recent",
+    annotations={
+        "title": "Get Recent Activity",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def cnote_get_recent(lines: int = 20) -> str:
+    """Return the most recent vault activity log entries.
+
+    Args:
+        lines (int): Number of recent entries to return (default 20, max 100)
+
+    Returns:
+        str: JSON with recent log lines
+    """
+    ensure_vault()
+    if not LOG_FILE.exists():
+        return json.dumps({"recent": []})
+    all_lines = LOG_FILE.read_text().splitlines()
+    recent = all_lines[-min(lines, 100) :]
+    return json.dumps({"count": len(recent), "recent": recent}, indent=2)
+
+
+@mcp.tool(
+    name="cnote_daily_today",
+    annotations={
+        "title": "Get or Create Today's Daily Note",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def cnote_daily_today() -> str:
+    """Return the content of today's daily note, creating it if it doesn't exist.
+
+    Returns:
+        str: JSON with path and content
+    """
+    ensure_vault()
+    file_path = today_daily_path()
+    date_str = datetime.now().strftime("%Y-%m-%d")
+
+    if not file_path.exists():
+        header = f"# Daily Note — {date_str}\n\n"
+        file_path.write_text(header)
+        rel_path = f"daily/{file_path.name}"
+        idx = load_index()
+        index_note(idx, rel_path, f"Daily {date_str}", "daily", "daily", ["#daily"])
+        save_index(idx)
+        append_log("created-daily", rel_path, date_str)
+
+    rel_path = f"daily/{file_path.name}"
+    return json.dumps(
+        {"path": rel_path, "date": date_str, "content": file_path.read_text()}, indent=2
+    )
+
+
+if __name__ == "__main__":
+    ensure_vault()
+    mcp.run()

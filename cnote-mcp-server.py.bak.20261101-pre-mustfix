@@ -1,0 +1,1314 @@
+"""
+C-Note MCP Server — v3
+Personal knowledge vault management for the C-Note vault.
+
+Design principles (v3):
+  1. READS ARE STRUCTURE-AGNOSTIC. Every read tool sees the entire vault,
+     regardless of folder schema. Legacy folders (logseq-mattie-aran,
+     imported-unsorted, loose root files) are fully visible.
+  2. WRITES ARE STRUCTURE-AWARE. New content is guided into the canonical
+     folders, but validation guides rather than walls off.
+  3. NOTHING IS EVER DELETED. There is no delete function in this codebase.
+     Retiring a note moves it to bin/. Significant rewrites snapshot the
+     old version to archive/ first. Both are excluded from normal search.
+  4. MOVES NEVER REWRITE CONTENT. A move is a move.
+
+Folder map:
+  inbox/     quick capture, triaged later          daily/    one file per day
+  clients/   per-client subfolders                 projects/ per-project subfolders
+  library/   reference, how-tos, sequences         life/     personal admin
+  _system/   vault docs & templates                archive/  auto-snapshots of old versions
+  bin/       retired notes (never deleted)
+  Legacy (read-only visibility): logseq-mattie-aran/, imported-unsorted/, Music/
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+from mcp.server.fastmcp import FastMCP
+from pydantic import BaseModel, Field, ConfigDict
+
+# ── Config ─────────────────────────────────────────────────────────────────────
+
+DEFAULT_VAULT_ROOT = Path("/Users/lupin/_Workspace/documents/notes/c-note")
+
+
+def _resolve_vault_root() -> Path:
+    env = os.environ.get("CNOTE_VAULT")
+    if env:
+        return Path(env).expanduser().resolve()
+    cfg = Path.home() / ".config" / "cnote" / "vault_path"
+    if cfg.exists():
+        return Path(cfg.read_text().strip()).expanduser().resolve()
+    return DEFAULT_VAULT_ROOT
+
+
+VAULT_ROOT = _resolve_vault_root()
+META_DIR = VAULT_ROOT / ".cnote"
+INDEX_FILE = META_DIR / "index.json"
+LOG_FILE = META_DIR / "activity.log"
+CONFIG_FILE = META_DIR / "config.json"
+MAX_LOG_LINES = 1000
+
+# ── Structural constants ───────────────────────────────────────────────────────
+
+# Canonical destinations for NEW content.
+WRITE_TOP_LEVEL = {"_system", "inbox", "daily", "clients", "projects", "library", "life"}
+
+# Folders holding per-entity subfolders.
+SUBFOLDER_PARENTS = {"clients", "projects"}
+
+# Special folders excluded from search/list/index unless explicitly included.
+ARCHIVE_TOP = "archive"
+BIN_TOP = "bin"
+EXCLUDED_TOPS = {ARCHIVE_TOP, BIN_TOP}
+
+# Max path depth (in folder segments) for new content.
+MAX_DEPTH = {"clients": 3, "projects": 3, "library": 2, "life": 2,
+             "_system": 2, "inbox": 1, "daily": 1}
+
+SHAPES = {"log", "evergreen", "index", "daily", "inbox"}
+
+# A tag token is #word, optionally namespaced: #shape/log, #client/foo-bar
+_TAG_TOKEN_RE = re.compile(r"^#[A-Za-z][A-Za-z0-9_/-]*$")
+
+# ── App ────────────────────────────────────────────────────────────────────────
+
+mcp = FastMCP("cnote_mcp")
+
+# ── Vault initialization ───────────────────────────────────────────────────────
+
+
+def ensure_vault():
+    META_DIR.mkdir(parents=True, exist_ok=True)
+    for d in sorted(WRITE_TOP_LEVEL | EXCLUDED_TOPS):
+        (VAULT_ROOT / d).mkdir(parents=True, exist_ok=True)
+    if not INDEX_FILE.exists():
+        INDEX_FILE.write_text(json.dumps({"notes": {}}, indent=2))
+    if not LOG_FILE.exists():
+        LOG_FILE.write_text("")
+    if not CONFIG_FILE.exists():
+        CONFIG_FILE.write_text(json.dumps({
+            "vault_version": "3.0",
+            "tag_style": "inline",
+            "git_autocommit": True,
+        }, indent=2))
+
+
+def load_config() -> dict:
+    try:
+        return json.loads(CONFIG_FILE.read_text())
+    except Exception:
+        return {}
+
+
+# ── Safety ─────────────────────────────────────────────────────────────────────
+
+
+class PathError(Exception):
+    pass
+
+
+def safe_path(rel_path: str, for_write: bool = False) -> Path:
+    """Resolve a vault-relative path and refuse anything that escapes the vault.
+
+    Rejects absolute paths, `..` traversal, and (for writes) hidden/system dirs.
+    """
+    rel = str(rel_path).strip()
+    if not rel:
+        raise PathError("empty path")
+    if rel.startswith(("/", "~")) or ".." in Path(rel).parts:
+        raise PathError(f"path must be vault-relative with no traversal: {rel_path}")
+    p = (VAULT_ROOT / rel).resolve()
+    try:
+        p.relative_to(VAULT_ROOT.resolve())
+    except ValueError:
+        raise PathError(f"path escapes the vault: {rel_path}")
+    if for_write:
+        parts = Path(rel).parts
+        if parts and parts[0].startswith("."):
+            raise PathError(f"cannot write into hidden folder: {parts[0]}")
+    return p
+
+
+def err(msg: str, **extra) -> str:
+    return json.dumps({"error": msg, **extra}, indent=2)
+
+
+# ── Index + log helpers ────────────────────────────────────────────────────────
+
+
+def load_index() -> dict:
+    ensure_vault()
+    try:
+        idx = json.loads(INDEX_FILE.read_text())
+        if "notes" not in idx:
+            idx = {"notes": {}}
+        return idx
+    except Exception:
+        return {"notes": {}}
+
+
+def save_index(idx: dict):
+    INDEX_FILE.write_text(json.dumps(idx, indent=2))
+
+
+def append_log(action: str, path: str, detail: str = ""):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    line = f"{ts} | {action} | {path} | {detail}\n"
+    existing = LOG_FILE.read_text() if LOG_FILE.exists() else ""
+    lines = existing.splitlines(keepends=True)
+    lines = lines[-(MAX_LOG_LINES - 1):]
+    lines.append(line)
+    LOG_FILE.write_text("".join(lines))
+
+
+def index_upsert(rel_path: str, title: str, folder: str, shape: str,
+                 tags: list[str], description: str = ""):
+    idx = load_index()
+    idx["notes"][rel_path] = {
+        "title": title,
+        "folder": folder,
+        "shape": shape,
+        "tags": tags,
+        "description": description or title,
+        "updated": datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+    save_index(idx)
+
+
+def index_remove(rel_path: str):
+    idx = load_index()
+    if rel_path in idx["notes"]:
+        del idx["notes"][rel_path]
+        save_index(idx)
+
+
+def index_move(old_rel: str, new_rel: str, folder: Optional[str] = None):
+    idx = load_index()
+    if old_rel in idx["notes"]:
+        meta = idx["notes"].pop(old_rel)
+        meta["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+        if folder:
+            meta["folder"] = folder
+        idx["notes"][new_rel] = meta
+        save_index(idx)
+
+
+# ── Git safety net ─────────────────────────────────────────────────────────────
+
+
+def git_commit(message: str):
+    """Auto-commit the vault after a write. Silent no-op on any failure."""
+    if not load_config().get("git_autocommit", True):
+        return
+    if not (VAULT_ROOT / ".git").exists():
+        return
+    try:
+        subprocess.run(["git", "-C", str(VAULT_ROOT), "add", "-A"],
+                       capture_output=True, timeout=20)
+        subprocess.run(["git", "-C", str(VAULT_ROOT), "commit", "-m",
+                        f"cnote: {message}", "--no-gpg-sign"],
+                       capture_output=True, timeout=20)
+    except Exception:
+        pass
+
+
+# ── Path / slug helpers ────────────────────────────────────────────────────────
+
+
+def slugify(text: str, max_len: int = 60) -> str:
+    text = text.lower().strip()
+    text = re.sub(r"[^\x00-\x7f]+", " ", text)
+    text = re.sub(r"[^\w\s-]", " ", text)
+    text = re.sub(r"[\s_]+", "-", text)
+    text = re.sub(r"-+", "-", text)
+    text = text.strip("-")
+    return text[:max_len]
+
+
+def normalize_folder(folder: str) -> tuple[Optional[str], str, list[str]]:
+    """Validate + normalize a destination folder for NEW content.
+
+    Returns (normalized_folder | None, error, warnings).
+    Segments below the top level are auto-slugified rather than rejected.
+    """
+    warnings: list[str] = []
+    if not folder or not folder.strip("/"):
+        return None, "folder is required", warnings
+
+    parts = [p for p in folder.strip("/").split("/") if p]
+    top = parts[0]
+
+    if top in EXCLUDED_TOPS:
+        return None, f"'{top}/' is managed automatically — use cn_retire (bin) or cn_update snapshots (archive)", warnings
+    if top not in WRITE_TOP_LEVEL:
+        return None, (f"'{top}' is not a canonical destination. "
+                      f"Valid: {sorted(WRITE_TOP_LEVEL)}. "
+                      f"(Legacy folders are readable but new content belongs in the canonical set.)"), warnings
+
+    max_depth = MAX_DEPTH.get(top, 2)
+    if len(parts) > max_depth:
+        return None, f"'{top}/' allows at most {max_depth} levels (got {len(parts)}: {folder})", warnings
+
+    if top in SUBFOLDER_PARENTS and len(parts) == 1:
+        return None, f"'{top}/' needs a subfolder, e.g. {top}/<slug>", warnings
+
+    fixed = [top]
+    for seg in parts[1:]:
+        s = slugify(seg)
+        if not s:
+            return None, f"cannot derive a slug from segment '{seg}'", warnings
+        if s != seg:
+            warnings.append(f"segment '{seg}' normalized to '{s}'")
+        fixed.append(s)
+
+    return "/".join(fixed), "", warnings
+
+
+def location_tag_for_folder(folder: str) -> Optional[str]:
+    parts = folder.strip("/").split("/")
+    top = parts[0]
+    if top == "clients" and len(parts) >= 2:
+        return f"#client/{parts[1]}"
+    if top == "projects" and len(parts) >= 2:
+        return f"#project/{parts[1]}"
+    if top == "library":
+        return "#library"
+    if top == "life":
+        return "#life"
+    return None
+
+
+def shape_tag(shape: str) -> str:
+    return f"#shape/{shape}"
+
+
+# ── Note parsing helpers ───────────────────────────────────────────────────────
+
+
+def is_tag_line(line: str) -> bool:
+    """True only if every whitespace-separated token is a valid #tag.
+
+    Strict on purpose: '#!/bin/bash', '#include <x>', '# Heading' all fail.
+    """
+    tokens = line.split()
+    return bool(tokens) and all(_TAG_TOKEN_RE.match(t) for t in tokens)
+
+
+def parse_note(content: str) -> dict:
+    """Non-destructive parse: {title, meta, tags, body_start, tag_line_no}.
+
+    Never used to rewrite content on moves — only to read metadata.
+    """
+    lines = content.splitlines()
+    title, meta = None, None
+    if lines and lines[0].startswith("# "):
+        title = lines[0][2:].strip()
+        if len(lines) > 1 and lines[1].startswith("*") and lines[1].endswith("*") and len(lines[1]) > 1:
+            meta = lines[1].strip("*")
+    tags: list[str] = []
+    tag_line_no = None
+    for i in range(len(lines) - 1, -1, -1):
+        if not lines[i].strip():
+            continue
+        if is_tag_line(lines[i]):
+            tags = lines[i].split()
+            tag_line_no = i
+        break
+    return {"title": title, "meta": meta, "tags": tags,
+            "tag_line_no": tag_line_no, "lines": lines}
+
+
+def strip_wrapper(content: str) -> tuple[Optional[str], str]:
+    """Strip canonical wrapper (title, meta line, trailing tag line) → (title, body).
+    Used only where wrapping is the point (cn_save, cn_inbox_file, cn_update)."""
+    p = parse_note(content)
+    lines = p["lines"]
+    start = 0
+    if p["title"] is not None:
+        start = 1
+        if p["meta"] is not None:
+            start = 2
+        while start < len(lines) and not lines[start].strip():
+            start += 1
+    end = p["tag_line_no"] if p["tag_line_no"] is not None else len(lines)
+    body = "\n".join(lines[start:end]).strip()
+    return p["title"], body
+
+
+def split_frontmatter(body: str) -> tuple[str, str]:
+    """Split a leading YAML frontmatter block off body → (frontmatter, rest).
+    frontmatter includes both --- fences and a trailing newline, or is ''."""
+    m = re.match(r"^---\n.*?\n---\n", body.lstrip(), re.S)
+    if not m:
+        return "", body
+    return m.group(0), body.lstrip()[m.end():]
+
+
+def render_body(title: str, body: str, tags: list[str], meta_note: str = "",
+                header: bool = True) -> str:
+    """Canonical note layout. Frontmatter in body is always hoisted to line 1
+    (Obsidian/Dataview only read it there). header=False omits title + meta."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    if not meta_note:
+        meta_note = f"Created {today}"
+    tag_line = "  ".join(tags)
+    fm, body = split_frontmatter(body)
+    head = f"# {title}\n*{meta_note}*\n\n" if header else ""
+    return f"{fm}{head}{body.strip()}\n\n{tag_line}\n"
+
+
+def merge_tags(*tag_groups) -> list[str]:
+    out: list[str] = []
+    for group in tag_groups:
+        for t in group or []:
+            t = t.strip()
+            if not t:
+                continue
+            if not t.startswith("#"):
+                t = "#" + t
+            if t not in out:
+                out.append(t)
+    return out
+
+
+def infer_shape(folder: str, stem: str, explicit: Optional[str] = None) -> str:
+    if explicit:
+        if explicit not in SHAPES:
+            raise ValueError(f"shape must be one of {sorted(SHAPES)}")
+        return explicit
+    top = folder.split("/")[0]
+    if top == "inbox":
+        return "inbox"
+    if top == "daily":
+        return "daily"
+    if stem == "_index":
+        return "index"
+    if re.match(r"^\d{4}-\d{2}-\d{2}", stem):
+        return "log"
+    return "evergreen"
+
+
+def daily_filename(date: str) -> str:
+    """YYYY-MM-DD -> 'YYYY-MM-DD-Weekday-Month-Dth.md' (matches Obsidian's
+    daily-notes format YYYY-MM-DD-dddd-MMMM-Do)."""
+    d = datetime.strptime(date, "%Y-%m-%d")
+    n = d.day
+    suffix = "th" if 11 <= n % 100 <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{date}-{d.strftime('%A')}-{d.strftime('%B')}-{n}{suffix}.md"
+
+
+DAILY_TEMPLATE = VAULT_ROOT / "_system" / "templates" / "daily.md"
+
+
+def _moment_to_strftime(d: datetime, fmt: str) -> str:
+    """Render the moment.js tokens used in daily templates (YYYY MMMM MM DD Do D dddd)."""
+    n = d.day
+    suffix = "th" if 11 <= n % 100 <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    tokens = {"YYYY": d.strftime("%Y"), "MMMM": d.strftime("%B"), "dddd": d.strftime("%A"),
+              "MM": d.strftime("%m"), "DD": d.strftime("%d"), "Do": f"{n}{suffix}", "D": str(n)}
+    return re.sub(r"YYYY|MMMM|dddd|MM|DD|Do|D", lambda m: tokens[m.group(0)], fmt)
+
+
+def daily_from_template(date: str) -> Optional[str]:
+    """Today's note body from _system/templates/daily.md, or None if no template."""
+    if not DAILY_TEMPLATE.exists():
+        return None
+    d = datetime.strptime(date, "%Y-%m-%d")
+    raw = DAILY_TEMPLATE.read_text()
+    return re.sub(r"\{\{date:([^}]+)\}\}", lambda m: _moment_to_strftime(d, m.group(1)), raw)
+
+
+def build_filename(shape: str, slug: str, date_override: Optional[str]) -> str:
+    if shape == "log":
+        date = date_override or datetime.now().strftime("%Y-%m-%d")
+        slug = re.sub(r"^\d{4}-\d{2}-\d{2}-?", "", slug)
+        return f"{date}-{slug}.md" if slug else f"{date}.md"
+    if shape == "index":
+        return "_index.md"
+    return f"{slug}.md"
+
+
+def unique_dest(folder: str, filename: str) -> tuple[Path, bool]:
+    """Return (path, collided). Suffixes -2, -3… but reports the collision."""
+    dest = VAULT_ROOT / folder / filename
+    if not dest.exists():
+        return dest, False
+    base, ext = dest.stem, dest.suffix
+    n = 2
+    while dest.exists():
+        dest = VAULT_ROOT / folder / f"{base}-{n}{ext}"
+        n += 1
+    return dest, True
+
+
+def ensure_subfolder(folder: str):
+    """Ensure destination exists; stub _index.md for new client/project subfolders."""
+    full = VAULT_ROOT / folder
+    full.mkdir(parents=True, exist_ok=True)
+    parts = folder.split("/")
+    if parts[0] in SUBFOLDER_PARENTS and len(parts) == 2:
+        index_path = full / "_index.md"
+        if not index_path.exists():
+            kind = "Client" if parts[0] == "clients" else "Project"
+            title = parts[1].replace("-", " ").title()
+            body = ("## What this is\n\n_(stub — fill in)_\n\n"
+                    "## Status\n\n_(stub — fill in)_\n\n"
+                    "## Key docs\n\n_(stub — populate as evergreen docs are added)_")
+            tags = [shape_tag("index")]
+            loc = location_tag_for_folder(folder)
+            if loc:
+                tags.append(loc)
+            index_path.write_text(render_body(f"{kind}: {title}", body, tags))
+            rel = str(index_path.relative_to(VAULT_ROOT))
+            index_upsert(rel, f"{kind}: {title}", folder, "index", tags, f"Index for {folder}")
+            append_log("stubbed-index", rel, "auto on subfolder create")
+
+
+def snapshot(file_path: Path) -> Optional[str]:
+    """Copy the current version of a file into archive/<original-path>/… before rewrite.
+
+    archive/library/gear-list--2026-07-23-1430.md  ← snapshot of library/gear-list.md
+    Never modifies or removes the original.
+    """
+    if not file_path.exists():
+        return None
+    rel = file_path.relative_to(VAULT_ROOT)
+    ts = datetime.now().strftime("%Y-%m-%d-%H%M")
+    arch_dir = VAULT_ROOT / ARCHIVE_TOP / rel.parent
+    arch_dir.mkdir(parents=True, exist_ok=True)
+    dest = arch_dir / f"{rel.stem}--{ts}{rel.suffix}"
+    n = 2
+    while dest.exists():
+        dest = arch_dir / f"{rel.stem}--{ts}-{n}{rel.suffix}"
+        n += 1
+    shutil.copy2(file_path, dest)
+    arel = str(dest.relative_to(VAULT_ROOT))
+    append_log("snapshot", arel, f"of {rel}")
+    return arel
+
+
+# ── Vault walking ──────────────────────────────────────────────────────────────
+
+
+def walk_vault(include_archive: bool = False, include_bin: bool = False):
+    """Yield every .md file in the vault as a vault-relative Path.
+
+    Skips hidden dirs (.obsidian, .git, .cnote, .trash, .smart-env) always.
+    Skips archive/ and bin/ unless asked. Sees EVERYTHING else, including
+    legacy folders and loose root files.
+    """
+    skip_tops = set()
+    if not include_archive:
+        skip_tops.add(ARCHIVE_TOP)
+    if not include_bin:
+        skip_tops.add(BIN_TOP)
+    for dirpath, dirnames, filenames in os.walk(VAULT_ROOT):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        rel_dir = Path(dirpath).relative_to(VAULT_ROOT)
+        parts = rel_dir.parts
+        if parts and parts[0] in skip_tops:
+            dirnames[:] = []
+            continue
+        for f in filenames:
+            if f.endswith(".md"):
+                yield rel_dir / f if parts else Path(f)
+
+
+# ── Input models ───────────────────────────────────────────────────────────────
+
+
+class SaveInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    content: str = Field(..., description="Markdown body content", min_length=1)
+    title: Optional[str] = Field(default=None, max_length=200,
+                                 description="Title. If omitted, derived from first heading/line.")
+    folder: str = Field(default="inbox", description=(
+        "Destination. One of: inbox, daily, library[/sub], life[/sub], "
+        "clients/<slug>[/sub], projects/<slug>[/sub], _system. Defaults to inbox."))
+    shape: Optional[str] = Field(default=None,
+                                 description="log | evergreen | index | inbox | daily. Inferred if omitted.")
+    slug: Optional[str] = Field(default=None, description="Explicit filename slug (no .md).")
+    date_override: Optional[str] = Field(default=None,
+                                         description="YYYY-MM-DD date prefix for shape=log.")
+    tags: Optional[list[str]] = Field(default_factory=list,
+                                      description="Extra tags beyond auto shape/location tags.")
+    description: Optional[str] = Field(default=None, max_length=300,
+                                       description="One-sentence description for the index.")
+
+
+class UpdateInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    rel_path: str = Field(..., description="Vault-relative path of the file to rewrite")
+    content: str = Field(..., min_length=1,
+                         description="New full body content (wrapper re-applied automatically)")
+    title: Optional[str] = Field(default=None, max_length=200,
+                                 description="New title; keeps existing if omitted")
+    tags: Optional[list[str]] = Field(default=None,
+                                      description="Replacement extra tags; keeps existing if omitted")
+    snapshot_old: bool = Field(default=True, description=(
+        "Copy the current version to archive/ before rewriting. Default true. "
+        "Set false ONLY for trivial edits (typos, small additions) where "
+        "no meaningful text is being changed or removed."))
+
+
+class RetireInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    rel_path: str = Field(..., description="Vault-relative path of the note to retire to bin/")
+    reason: Optional[str] = Field(default=None, max_length=200,
+                                  description="Short reason, recorded in the activity log")
+
+
+class InboxFileInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    filename: str = Field(..., description="Filename in inbox/ (no path prefix)")
+    destination_folder: str = Field(..., description="e.g. clients/418-productions, library, projects/lemr")
+    new_slug: Optional[str] = Field(default=None)
+    shape: Optional[str] = Field(default=None, description="log | evergreen | index. Inferred if omitted.")
+    title: Optional[str] = Field(default=None, max_length=200)
+    tags: Optional[list[str]] = Field(default_factory=list)
+    description: Optional[str] = Field(default=None, max_length=300)
+
+
+class MoveInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    from_path: str = Field(..., description="Current vault-relative path (bin/... allowed, for restores)")
+    to_folder: str = Field(..., description="Destination folder (canonical set)")
+    new_slug: Optional[str] = Field(default=None, description="Rename during move (no .md)")
+    retag: bool = Field(default=True,
+                        description="Update location/shape tags on the trailing tag line (content untouched)")
+
+
+class SearchInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    query: str = Field(..., min_length=1)
+    folder: Optional[str] = Field(default=None, description="Restrict to a folder prefix")
+    tag: Optional[str] = Field(default=None, description="Require this tag")
+    limit: int = Field(default=10, ge=1, le=50)
+    include_archive: bool = Field(default=False, description="Also search archive/ snapshots")
+    include_bin: bool = Field(default=False, description="Also search retired notes in bin/")
+
+
+class GetInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    rel_path: str = Field(..., min_length=1)
+
+
+class AppendInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    rel_path: str = Field(..., min_length=1)
+    content: str = Field(..., min_length=1)
+
+
+class ListInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    folder: Optional[str] = Field(default=None,
+                                  description="Folder to list; omit for vault root")
+    recursive: bool = Field(default=False, description="Recurse into subfolders")
+    include_archive: bool = Field(default=False)
+    include_bin: bool = Field(default=False)
+
+
+class ReindexInput(BaseModel):
+    model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
+    dry_run: bool = Field(default=False, description="Report changes without writing index.json")
+
+
+# ── Tools: reading (structure-agnostic — use these freely and proactively) ─────
+
+
+@mcp.tool(name="cn_search", annotations={
+    "title": "Search Vault", "readOnlyHint": True, "destructiveHint": False,
+    "idempotentHint": True, "openWorldHint": False})
+async def cn_search(params: SearchInput) -> str:
+    """Full-text search across EVERY note in the vault (filenames, titles, tags, content).
+
+    Use this proactively and without asking whenever a conversation touches
+    anything Mattie may have notes on: clients, projects, gear, past work,
+    how-tos, personal reference. Checking c-note first is expected behavior.
+
+    Scans the filesystem directly — never blinded by a stale index. archive/
+    and bin/ are excluded unless include_archive / include_bin is set.
+    """
+    ensure_vault()
+    idx = load_index()["notes"]
+    terms = [t for t in params.query.lower().split() if t]
+    if not terms:
+        return err("empty query")
+    results = []
+    prefix = params.folder.strip("/") + "/" if params.folder else None
+
+    for rel in walk_vault(params.include_archive, params.include_bin):
+        rel_str = str(rel)
+        if prefix and not rel_str.startswith(prefix):
+            continue
+        fp = VAULT_ROOT / rel
+        try:
+            if fp.stat().st_size > 1_000_000:
+                continue
+            text = fp.read_text(errors="replace")
+        except Exception:
+            continue
+
+        p = parse_note(text)
+        if params.tag and params.tag not in p["tags"]:
+            continue
+
+        name_l = rel_str.lower()
+        title_l = (p["title"] or "").lower()
+        tags_l = " ".join(p["tags"]).lower()
+        content_l = text.lower()
+
+        score, snippet = 0, ""
+        for term in terms:
+            if term in name_l:
+                score += 3
+            if term in title_l:
+                score += 3
+            if term in tags_l:
+                score += 2
+            hits = content_l.count(term)
+            if hits:
+                score += min(hits, 5)
+                if not snippet:
+                    i = content_l.find(term)
+                    snippet = "…" + text[max(0, i - 60):i + 120].strip().replace("\n", " ") + "…"
+        if score > 0:
+            meta = idx.get(rel_str, {})
+            results.append({
+                "path": rel_str,
+                "title": p["title"] or rel.stem,
+                "tags": p["tags"],
+                "score": score,
+                "snippet": snippet,
+                "description": meta.get("description", ""),
+                "modified": datetime.fromtimestamp(fp.stat().st_mtime).strftime("%Y-%m-%d"),
+            })
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return json.dumps({"query": params.query, "count": len(results[:params.limit]),
+                       "total_matches": len(results),
+                       "results": results[:params.limit]}, indent=2)
+
+
+@mcp.tool(name="cn_get", annotations={
+    "title": "Get File", "readOnlyHint": True, "destructiveHint": False,
+    "idempotentHint": True, "openWorldHint": False})
+async def cn_get(params: GetInput) -> str:
+    """Return the full content of any file in the vault by relative path.
+
+    Works on every folder, including legacy imports, archive/ and bin/.
+    Use freely whenever a note might be relevant."""
+    ensure_vault()
+    try:
+        fp = safe_path(params.rel_path)
+    except PathError as e:
+        return err(str(e))
+    if not fp.exists():
+        return err(f"file not found: {params.rel_path}",
+                   hint="use cn_search or cn_list to locate it")
+    meta = load_index()["notes"].get(params.rel_path, {})
+    return json.dumps({"path": params.rel_path, "meta": meta,
+                       "content": fp.read_text(errors="replace")}, indent=2)
+
+
+@mcp.tool(name="cn_list", annotations={
+    "title": "List Folder", "readOnlyHint": True, "destructiveHint": False,
+    "idempotentHint": True, "openWorldHint": False})
+async def cn_list(params: ListInput) -> str:
+    """Browse any folder in the vault — subfolders with note counts, files with titles.
+
+    Structure-agnostic: legacy folders, deep nesting, and loose root files all
+    show up. Use with no folder argument to see the whole top level."""
+    ensure_vault()
+    base = VAULT_ROOT
+    rel_base = ""
+    if params.folder:
+        try:
+            base = safe_path(params.folder)
+        except PathError as e:
+            return err(str(e))
+        if not base.is_dir():
+            return err(f"not a folder: {params.folder}")
+        rel_base = str(Path(params.folder).as_posix()).strip("/")
+
+    dirs, files = [], []
+    if params.recursive:
+        entries = sorted(base.rglob("*"))
+    else:
+        entries = sorted(base.iterdir())
+    for p in entries:
+        if any(part.startswith(".") for part in p.relative_to(VAULT_ROOT).parts):
+            continue
+        rel = str(p.relative_to(VAULT_ROOT))
+        top = rel.split("/")[0]
+        if top == ARCHIVE_TOP and not params.include_archive:
+            continue
+        if top == BIN_TOP and not params.include_bin:
+            continue
+        if p.is_dir():
+            dirs.append({"path": rel,
+                         "note_count": sum(1 for _ in p.rglob("*.md"))})
+        elif p.suffix == ".md":
+            title = None
+            try:
+                with open(p, errors="replace") as fh:
+                    first = fh.readline().strip()
+                if first.startswith("# "):
+                    title = first[2:]
+            except Exception:
+                pass
+            files.append({"path": rel, "title": title or p.stem,
+                          "modified": datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d")})
+    return json.dumps({"folder": rel_base or "(vault root)",
+                       "subfolders": dirs, "notes": files,
+                       "counts": {"subfolders": len(dirs), "notes": len(files)}}, indent=2)
+
+
+@mcp.tool(name="cn_index", annotations={
+    "title": "Get Vault Index", "readOnlyHint": True, "destructiveHint": False,
+    "idempotentHint": True, "openWorldHint": False})
+async def cn_index(folder: Optional[str] = None, shape: Optional[str] = None,
+                   tag: Optional[str] = None) -> str:
+    """Return the curated vault index (titles, descriptions, tags), optionally filtered.
+
+    The index is a catalog, not the source of truth — run cn_reindex if it
+    looks stale, and use cn_search/cn_list for guaranteed-complete views."""
+    ensure_vault()
+    notes = load_index()["notes"]
+    if folder:
+        prefix = folder.strip("/") + "/"
+        notes = {k: v for k, v in notes.items() if k.startswith(prefix)}
+    if shape:
+        notes = {k: v for k, v in notes.items() if v.get("shape") == shape}
+    if tag:
+        notes = {k: v for k, v in notes.items() if tag in v.get("tags", [])}
+    return json.dumps({"total_notes": len(notes),
+                       "filters": {"folder": folder, "shape": shape, "tag": tag},
+                       "notes": notes}, indent=2)
+
+
+@mcp.tool(name="cn_recent", annotations={
+    "title": "Recent Activity", "readOnlyHint": True, "destructiveHint": False,
+    "idempotentHint": True, "openWorldHint": False})
+async def cn_recent(lines: int = 20) -> str:
+    """Recent vault activity: MCP action log plus recently modified files
+    (catches edits made directly in Obsidian too). Good session-start context."""
+    ensure_vault()
+    log_lines = LOG_FILE.read_text().splitlines() if LOG_FILE.exists() else []
+    recent_log = log_lines[-min(lines, 200):]
+
+    mtimes = []
+    for rel in walk_vault():
+        fp = VAULT_ROOT / rel
+        try:
+            mtimes.append((fp.stat().st_mtime, str(rel)))
+        except Exception:
+            continue
+    mtimes.sort(reverse=True)
+    recent_files = [{"path": r, "modified": datetime.fromtimestamp(m).strftime("%Y-%m-%d %H:%M")}
+                    for m, r in mtimes[:min(lines, 50)]]
+    return json.dumps({"activity_log": recent_log, "recently_modified": recent_files}, indent=2)
+
+
+@mcp.tool(name="cn_clients", annotations={
+    "title": "List Clients", "readOnlyHint": True, "destructiveHint": False,
+    "idempotentHint": True, "openWorldHint": False})
+async def cn_clients() -> str:
+    """List every client under clients/ with note counts (recursive) and index title."""
+    return _list_entities("clients")
+
+
+@mcp.tool(name="cn_projects", annotations={
+    "title": "List Projects", "readOnlyHint": True, "destructiveHint": False,
+    "idempotentHint": True, "openWorldHint": False})
+async def cn_projects() -> str:
+    """List every project under projects/ with note counts (recursive) and index title."""
+    return _list_entities("projects")
+
+
+def _list_entities(kind: str) -> str:
+    ensure_vault()
+    base = VAULT_ROOT / kind
+    out = []
+    for sub in sorted([p for p in base.iterdir() if p.is_dir()]):
+        idx_md = sub / "_index.md"
+        title = sub.name
+        if idx_md.exists():
+            for line in idx_md.read_text(errors="replace").splitlines():
+                if line.startswith("# "):
+                    title = line[2:].strip()
+                    break
+        out.append({"slug": sub.name, "path": f"{kind}/{sub.name}", "title": title,
+                    "note_count": sum(1 for _ in sub.rglob("*.md"))})
+    return json.dumps({"count": len(out), kind: out}, indent=2)
+
+
+@mcp.tool(name="cn_inbox_list", annotations={
+    "title": "List Inbox", "readOnlyHint": True, "destructiveHint": False,
+    "idempotentHint": True, "openWorldHint": False})
+async def cn_inbox_list() -> str:
+    """Show every file in inbox/ with a snippet, for triage."""
+    ensure_vault()
+    items = []
+    for p in sorted((VAULT_ROOT / "inbox").glob("*.md")):
+        try:
+            text = p.read_text(errors="replace")
+            snippet = text.strip().splitlines()[0][:120] if text.strip() else "(empty)"
+            items.append({"filename": p.name, "size": p.stat().st_size,
+                          "mtime": datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
+                          "snippet": snippet})
+        except Exception as e:
+            items.append({"filename": p.name, "error": str(e)})
+    return json.dumps({"count": len(items), "items": items}, indent=2)
+
+
+# ── Tools: writing (structure-aware) ───────────────────────────────────────────
+
+
+@mcp.tool(name="cn_save", annotations={
+    "title": "Save Note", "readOnlyHint": False, "destructiveHint": False,
+    "idempotentHint": False, "openWorldHint": False})
+async def cn_save(params: SaveInput) -> str:
+    """Create a NEW note in a canonical folder with the standard wrapper and auto-tags.
+
+    For rewriting an existing note use cn_update (it snapshots the old
+    version). Collisions are suffixed and reported — check the response."""
+    ensure_vault()
+    folder, e, warnings = normalize_folder(params.folder)
+    if e:
+        return err(e)
+
+    if folder == "daily":
+        return await _save_to_daily(params)
+
+    title = params.title or (strip_wrapper(params.content)[0]
+                             or _first_line_title(params.content))
+    slug = params.slug or slugify(title)
+    if not slug:
+        return err("could not derive a valid slug from title")
+
+    try:
+        shape = infer_shape(folder, slug, params.shape)
+    except ValueError as ve:
+        return err(str(ve))
+    filename = build_filename(shape, slug, params.date_override)
+
+    ensure_subfolder(folder)
+    dest, collided = unique_dest(folder, filename)
+
+    auto = [shape_tag(shape)]
+    loc = location_tag_for_folder(folder)
+    if loc:
+        auto.append(loc)
+    all_tags = merge_tags(auto, params.tags or [])
+
+    _, body = strip_wrapper(params.content)
+    dest.write_text(render_body(title, body or params.content.strip(), all_tags))
+
+    rel = str(dest.relative_to(VAULT_ROOT))
+    index_upsert(rel, title, folder, shape, all_tags, params.description or title)
+    append_log("save", rel, title)
+    git_commit(f"save {rel}")
+
+    resp = {"action": "created", "path": rel, "title": title, "shape": shape,
+            "tags": all_tags, "message": f"'{title}' → {rel}"}
+    if warnings:
+        resp["warnings"] = warnings
+    if collided:
+        resp["warnings"] = resp.get("warnings", []) + [
+            f"name collision: saved as {dest.name} — a file with the original name exists; "
+            f"consider cn_update on the original instead"]
+    return json.dumps(resp, indent=2)
+
+
+def _first_line_title(content: str) -> str:
+    for line in content.splitlines():
+        if line.strip():
+            return line.strip()[:120]
+    return "Untitled"
+
+
+async def _save_to_daily(params: SaveInput) -> str:
+    date = params.date_override or datetime.now().strftime("%Y-%m-%d")
+    daily = VAULT_ROOT / "daily" / daily_filename(date)
+    title = params.title or _first_line_title(params.content)
+    _, body = strip_wrapper(params.content)
+    body = body or params.content.strip()
+    ts = datetime.now().strftime("%H:%M")
+
+    if daily.exists():
+        text = daily.read_text()
+        p = parse_note(text)
+        addition = f"\n---\n\n## {ts} — {title}\n\n{body}\n"
+        lines = p["lines"]
+        insert_at = p["tag_line_no"] if p["tag_line_no"] is not None else len(lines)
+        new_tags = merge_tags(p["tags"], params.tags or [])
+        if p["tag_line_no"] is not None:
+            lines[p["tag_line_no"]] = "  ".join(new_tags)
+        daily.write_text("\n".join(lines[:insert_at] + addition.splitlines()
+                                   + [""] + lines[insert_at:]) + "\n")
+        action = "appended-daily"
+    else:
+        all_tags = merge_tags([shape_tag("daily")], params.tags or [])
+        tpl = daily_from_template(date)
+        if tpl is not None:
+            daily.write_text(render_body("", f"{tpl.rstrip()}\n\n## {ts} — {title}\n\n{body}",
+                                         all_tags, header=False))
+        else:
+            daily.write_text(render_body(f"Daily Note — {date}",
+                                         f"## {ts} — {title}\n\n{body}",
+                                         all_tags, f"Created {date}"))
+        action = "created-daily"
+
+    rel = str(daily.relative_to(VAULT_ROOT))
+    idx = load_index()
+    entry = idx["notes"].get(rel, {"title": f"Daily — {date}", "folder": "daily",
+                                   "shape": "daily", "tags": [shape_tag("daily")],
+                                   "description": f"Daily journal {date}"})
+    entry["updated"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    idx["notes"][rel] = entry
+    save_index(idx)
+    append_log(action, rel, title)
+    git_commit(f"{action} {rel}")
+    return json.dumps({"action": action, "path": rel, "title": title,
+                       "message": f"'{title}' → {rel}"}, indent=2)
+
+
+@mcp.tool(name="cn_update", annotations={
+    "title": "Update Note (snapshots old version)", "readOnlyHint": False,
+    "destructiveHint": False, "idempotentHint": False, "openWorldHint": False})
+async def cn_update(params: UpdateInput) -> str:
+    """Rewrite an existing note's body. By default the OLD version is first
+    snapshotted to archive/, so no text is ever lost.
+
+    Use snapshot_old=false only for trivial edits. For adding content to the
+    end of a note, prefer cn_append (no snapshot needed)."""
+    ensure_vault()
+    try:
+        fp = safe_path(params.rel_path, for_write=True)
+    except PathError as e:
+        return err(str(e))
+    if not fp.exists():
+        return err(f"file not found: {params.rel_path}", hint="use cn_save for new notes")
+
+    old = fp.read_text(errors="replace")
+    old_parsed = parse_note(old)
+    title = params.title or old_parsed["title"] or fp.stem.replace("-", " ").title()
+
+    folder = str(Path(params.rel_path).parent.as_posix())
+    if folder == ".":
+        folder = ""
+    shape = infer_shape(folder or "library", fp.stem)
+    auto = [shape_tag(shape)]
+    loc = location_tag_for_folder(folder) if folder else None
+    if loc:
+        auto.append(loc)
+    keep = params.tags if params.tags is not None else [
+        t for t in old_parsed["tags"]
+        if not (t.startswith("#shape/") or t.startswith("#client/")
+                or t.startswith("#project/") or t in ("#library", "#life"))]
+    all_tags = merge_tags(auto, keep)
+
+    arel = snapshot(fp) if params.snapshot_old else None
+
+    _, body = strip_wrapper(params.content)
+    today = datetime.now().strftime("%Y-%m-%d")
+    meta = f"Updated {today}" + (" — previous version in archive/" if arel else "")
+    fp.write_text(render_body(title, body or params.content.strip(), all_tags, meta,
+                              header=(shape != "daily")))
+
+    index_upsert(params.rel_path, title, folder, shape, all_tags)
+    append_log("update", params.rel_path, f"snapshot: {arel or 'skipped'}")
+    git_commit(f"update {params.rel_path}")
+    return json.dumps({"action": "updated", "path": params.rel_path, "title": title,
+                       "tags": all_tags, "snapshot": arel,
+                       "message": f"updated {params.rel_path}"
+                                  + (f" (old version → {arel})" if arel else "")}, indent=2)
+
+
+@mcp.tool(name="cn_append", annotations={
+    "title": "Append to Note", "readOnlyHint": False, "destructiveHint": False,
+    "idempotentHint": False, "openWorldHint": False})
+async def cn_append(params: AppendInput) -> str:
+    """Append content to an existing note with a timestamped divider.
+    Content is inserted before the trailing tag line. Exact path required."""
+    ensure_vault()
+    try:
+        fp = safe_path(params.rel_path, for_write=True)
+    except PathError as e:
+        return err(str(e))
+    if not fp.exists():
+        return err(f"file not found: {params.rel_path}")
+
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    p = parse_note(fp.read_text(errors="replace"))
+    lines = p["lines"]
+    insert_at = p["tag_line_no"] if p["tag_line_no"] is not None else len(lines)
+    addition = f"\n---\n*Added {ts}*\n\n{params.content.strip()}\n"
+    fp.write_text("\n".join(lines[:insert_at] + addition.splitlines()
+                            + [""] + lines[insert_at:]) + "\n")
+
+    idx = load_index()
+    if params.rel_path in idx["notes"]:
+        idx["notes"][params.rel_path]["updated"] = ts
+        save_index(idx)
+    append_log("append", params.rel_path, "")
+    git_commit(f"append {params.rel_path}")
+    return json.dumps({"path": params.rel_path,
+                       "message": f"appended to {params.rel_path}"}, indent=2)
+
+
+@mcp.tool(name="cn_move", annotations={
+    "title": "Move Note (content untouched)", "readOnlyHint": False,
+    "destructiveHint": False, "idempotentHint": False, "openWorldHint": False})
+async def cn_move(params: MoveInput) -> str:
+    """Move a note to a new folder WITHOUT rewriting its content.
+
+    Optionally renames (new_slug) and refreshes location/shape tags — but only
+    on the trailing tag line; the body is never touched. Also restores notes
+    from bin/ (use a bin/... from_path)."""
+    ensure_vault()
+    try:
+        src = safe_path(params.from_path)
+    except PathError as e:
+        return err(str(e))
+    if not src.exists():
+        return err(f"{params.from_path} not found")
+
+    folder, e, warnings = normalize_folder(params.to_folder)
+    if e:
+        return err(e)
+
+    filename = f"{slugify(params.new_slug)}.md" if params.new_slug else src.name
+    ensure_subfolder(folder)
+    dest, collided = unique_dest(folder, filename)
+
+    shutil.move(str(src), str(dest))
+
+    if params.retag:
+        _retag_in_place(dest, folder)
+
+    src_rel, dst_rel = params.from_path, str(dest.relative_to(VAULT_ROOT))
+    index_move(src_rel, dst_rel, folder)
+    append_log("move", dst_rel, f"from {src_rel}")
+    git_commit(f"move {src_rel} -> {dst_rel}")
+
+    resp = {"from": src_rel, "to": dst_rel, "message": f"{src_rel} → {dst_rel}"}
+    if collided:
+        warnings = warnings + [f"name collision at destination: saved as {dest.name}"]
+    if warnings:
+        resp["warnings"] = warnings
+    return json.dumps(resp, indent=2)
+
+
+def _retag_in_place(fp: Path, folder: str):
+    """Refresh shape/location tags on the trailing tag line ONLY. Never touches body.
+    If the file has no tag line, one is added at the end."""
+    text = fp.read_text(errors="replace")
+    p = parse_note(text)
+    shape = infer_shape(folder, fp.stem)
+    keep = [t for t in p["tags"]
+            if not (t.startswith("#shape/") or t.startswith("#client/")
+                    or t.startswith("#project/") or t in ("#library", "#life"))]
+    auto = [shape_tag(shape)]
+    loc = location_tag_for_folder(folder)
+    if loc:
+        auto.append(loc)
+    new_line = "  ".join(merge_tags(auto, keep))
+    lines = p["lines"]
+    if p["tag_line_no"] is not None:
+        lines[p["tag_line_no"]] = new_line
+    else:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.append(new_line)
+    fp.write_text("\n".join(lines) + "\n")
+
+
+@mcp.tool(name="cn_retire", annotations={
+    "title": "Retire Note to bin/ (nothing is ever deleted)", "readOnlyHint": False,
+    "destructiveHint": False, "idempotentHint": False, "openWorldHint": False})
+async def cn_retire(params: RetireInput) -> str:
+    """Move a note to bin/, preserving its original path. This is the ONLY
+    removal mechanism — no delete exists. bin/ is excluded from search unless
+    explicitly included; restore any time with cn_move."""
+    ensure_vault()
+    try:
+        src = safe_path(params.rel_path, for_write=True)
+    except PathError as e:
+        return err(str(e))
+    if not src.exists():
+        return err(f"{params.rel_path} not found")
+    rel = Path(params.rel_path)
+    if rel.parts and rel.parts[0] == BIN_TOP:
+        return err("already in bin/")
+
+    dest_dir = VAULT_ROOT / BIN_TOP / rel.parent
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / rel.name
+    n = 2
+    while dest.exists():
+        dest = dest_dir / f"{rel.stem}-{n}{rel.suffix}"
+        n += 1
+    shutil.move(str(src), str(dest))
+
+    dst_rel = str(dest.relative_to(VAULT_ROOT))
+    index_remove(params.rel_path)
+    append_log("retire", dst_rel, params.reason or "")
+    git_commit(f"retire {params.rel_path}")
+    return json.dumps({"action": "retired", "from": params.rel_path, "to": dst_rel,
+                       "message": f"{params.rel_path} → {dst_rel} (restore with cn_move)"},
+                      indent=2)
+
+
+@mcp.tool(name="cn_inbox_file", annotations={
+    "title": "File from Inbox", "readOnlyHint": False, "destructiveHint": False,
+    "idempotentHint": False, "openWorldHint": False})
+async def cn_inbox_file(params: InboxFileInput) -> str:
+    """Move one file from inbox/ to its destination, applying the canonical
+    wrapper and auto-tags. Body text is preserved verbatim."""
+    ensure_vault()
+    src = VAULT_ROOT / "inbox" / Path(params.filename).name
+    if not src.exists():
+        return err(f"inbox/{params.filename} not found")
+
+    folder, e, warnings = normalize_folder(params.destination_folder)
+    if e:
+        return err(e)
+
+    original = src.read_text(errors="replace")
+    parsed_title, body = strip_wrapper(original)
+    title = params.title or parsed_title or _first_line_title(original)
+    slug = params.new_slug or slugify(title)
+    if not slug:
+        return err("could not derive a valid slug")
+
+    try:
+        shape = infer_shape(folder, slug, params.shape)
+    except ValueError as ve:
+        return err(str(ve))
+    filename = build_filename(shape, slug, None)
+
+    ensure_subfolder(folder)
+    dest, collided = unique_dest(folder, filename)
+
+    auto = [shape_tag(shape)]
+    loc = location_tag_for_folder(folder)
+    if loc:
+        auto.append(loc)
+    all_tags = merge_tags(auto, params.tags or [])
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    dest.write_text(render_body(title, body or original.strip(), all_tags,
+                                f"Filed from inbox {today}"))
+    src.unlink()  # content now lives at dest — this is a move, not a delete
+
+    src_rel = f"inbox/{params.filename}"
+    dst_rel = str(dest.relative_to(VAULT_ROOT))
+    index_upsert(dst_rel, title, folder, shape, all_tags, params.description or title)
+    append_log("inbox-file", dst_rel, f"from {src_rel}")
+    git_commit(f"inbox-file {src_rel} -> {dst_rel}")
+
+    resp = {"from": src_rel, "to": dst_rel, "title": title, "shape": shape,
+            "tags": all_tags, "message": f"{src_rel} → {dst_rel}"}
+    if collided:
+        warnings = warnings + [f"name collision: saved as {dest.name}"]
+    if warnings:
+        resp["warnings"] = warnings
+    return json.dumps(resp, indent=2)
+
+
+@mcp.tool(name="cn_daily", annotations={
+    "title": "Get Today's Daily Note", "readOnlyHint": False, "destructiveHint": False,
+    "idempotentHint": True, "openWorldHint": False})
+async def cn_daily() -> str:
+    """Return today's daily note, creating it if needed."""
+    ensure_vault()
+    date = datetime.now().strftime("%Y-%m-%d")
+    daily = VAULT_ROOT / "daily" / daily_filename(date)
+    if not daily.exists():
+        tags = [shape_tag("daily")]
+        tpl = daily_from_template(date)
+        daily.write_text(render_body("", tpl, tags, header=False) if tpl is not None
+                         else render_body(f"Daily Note — {date}", "", tags, f"Created {date}"))
+        rel = str(daily.relative_to(VAULT_ROOT))
+        index_upsert(rel, f"Daily — {date}", "daily", "daily", tags, f"Daily journal {date}")
+        append_log("created-daily", rel, date)
+        git_commit(f"created-daily {rel}")
+    rel = str(daily.relative_to(VAULT_ROOT))
+    return json.dumps({"path": rel, "date": date, "content": daily.read_text()}, indent=2)
+
+
+# ── Tools: maintenance ─────────────────────────────────────────────────────────
+
+
+@mcp.tool(name="cn_reindex", annotations={
+    "title": "Rebuild Vault Index from Disk", "readOnlyHint": False,
+    "destructiveHint": False, "idempotentHint": True, "openWorldHint": False})
+async def cn_reindex(params: ReindexInput) -> str:
+    """Rebuild .cnote/index.json by scanning every note on disk.
+
+    Heals index drift: files created/moved/renamed outside MCP get indexed;
+    entries for missing files are dropped. Existing descriptions are kept.
+    Run whenever the index seems out of step with reality."""
+    ensure_vault()
+    old = load_index()["notes"]
+    new_notes: dict = {}
+    added, kept = 0, 0
+
+    for rel in walk_vault():
+        rel_str = str(rel)
+        fp = VAULT_ROOT / rel
+        try:
+            text = fp.read_text(errors="replace")
+        except Exception:
+            continue
+        p = parse_note(text)
+        folder = str(rel.parent.as_posix())
+        if folder == ".":
+            folder = ""
+        tags = p["tags"]
+        shape = next((t.split("/", 1)[1] for t in tags
+                      if t.startswith("#shape/") and t.split("/", 1)[1] in SHAPES), None)
+        if not shape:
+            shape = infer_shape(folder or "library", rel.stem)
+        prev = old.get(rel_str)
+        new_notes[rel_str] = {
+            "title": p["title"] or rel.stem,
+            "folder": folder,
+            "shape": shape,
+            "tags": tags,
+            "description": (prev or {}).get("description") or p["title"] or rel.stem,
+            "updated": datetime.fromtimestamp(fp.stat().st_mtime).strftime("%Y-%m-%d %H:%M"),
+        }
+        if prev:
+            kept += 1
+        else:
+            added += 1
+
+    removed = [k for k in old if k not in new_notes]
+    summary = {"total_indexed": len(new_notes), "added": added, "kept": kept,
+               "stale_removed": len(removed),
+               "stale_examples": removed[:10],
+               "dry_run": params.dry_run}
+    if not params.dry_run:
+        save_index({"notes": new_notes})
+        append_log("reindex", ".cnote/index.json",
+                   f"{len(new_notes)} notes ({added} new, {len(removed)} stale dropped)")
+        git_commit("reindex")
+    return json.dumps(summary, indent=2)
+
+
+# ── Entrypoint ─────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    ensure_vault()
+    mcp.run()
